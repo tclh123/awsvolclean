@@ -188,6 +188,8 @@ class VolumeCleaner:
     def tag_filter(self, volume):
         if not self.args.tags:
             return True
+        if not volume.tags:
+            return False
 
         for tag in self.args.tags:
             search_key, search_value = tag.split(':', 1)
