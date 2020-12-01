@@ -38,7 +38,8 @@ def main(argv):
     p.add_argument('--pool-size', '-p',
                    help='Thread Pool Size - how many AWS API requests we do in parallel (default: 10)',
                    dest='pool_size', default=10, type=int)
-    p.add_argument('--resource', '-R', help='Resource type, default: %(default)s', choices=('volumes', 'snapshots'), default='volumes')
+    p.add_argument('--resource', '-R', help='Resource type, default: %(default)s',
+                   choices=('volumes', 'snapshots', 'ami'), default='volumes')
     p.add_argument('--age', '-a', help='Days after which a Volume is considered orphaned (default: 14)', dest='age',
                    default=14, type=check_positive)
     p.add_argument('--tags', '-t', help='Tag filter in format "key:regex" (E.g. Name:^integration-test)',
@@ -151,8 +152,8 @@ class VolumeCleaner:
             try:
                 if resource == 'volumes':
                     p.map(self.remove_volume, candidates)
-                elif resource == 'snapshots':
-                    p.map(self.remove_snapshot, candidates)
+                else:
+                    p.map(partial(self.remove_resource, resource_type=resource), candidates)
             finally:
                 p.close()
                 p.join()
@@ -168,11 +169,13 @@ class VolumeCleaner:
             resources = ec2.volumes.filter(Filters=[{'Name': 'status', 'Values': ['available']}])
             self.log.debug(
                 'Found {} unused Volumes in Account {} Region {}'.format(len(list(resources)), self.account, self.region))
-        else:
+        elif resource == 'snapshots':
             # resources = ec2.snapshots.filter(Filters=[{'Name': 'tag:OS_Version', 'Values': ['Ubuntu']}])
             resources = ec2.snapshots.filter(OwnerIds=['self'])
             self.log.debug(
                 'Found {} Snapshots in Account {} Region {}'.format(len(list(resources)), self.account, self.region))
+        elif resource == 'ami':
+            resources = ec2.images.filter(Owners=['self'])
         return resources
 
     # based on http://blog.ranman.org/cleaning-up-aws-with-boto3/
@@ -262,13 +265,19 @@ class VolumeCleaner:
                                                                                                            self.account,
                                                                                                            self.region))
                     return None
-        else:
-            # NOTE: this is for Snapshots, we can only use start_time
+        elif resource_type == 'snapshots':
             expire = resource.start_time + timedelta(days=self.args.age)
             if now < expire:
                 return
             self.log.debug(
                 'resource {} {} in Account {} Region {} is a candidate for deletion'.format(resource.id, resource.description, self.account,
+                                                                                       self.region))
+        elif resource_type == 'ami':
+            expire = datetime.strptime(resource.creation_date, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc) + timedelta(days=self.args.age)
+            if now < expire:
+                return
+            self.log.debug(
+                'resource {} {} in Account {} Region {} is a candidate for deletion'.format(resource.id, resource.name, self.account,
                                                                                        self.region))
 
         return resource
@@ -296,19 +305,32 @@ class VolumeCleaner:
 
     @retry(stop_max_attempt_number=100, wait_exponential_multiplier=1000, wait_exponential_max=30000,
            retry_on_exception=retry_on_request_limit_exceeded)
-    def remove_snapshot(self, snapshot, thread_safe=True):
+    def remove_resource(self, resource, resource_type='snapshot', thread_safe=True):
         if thread_safe:
             session = aws_session(self.account, self.role)
             ec2 = session.resource('ec2', region_name=self.region)
-            snapshot = ec2.Snapshot(snapshot.id)
+            if resource_type == 'snapshot':
+                resource = ec2.Snapshot(resource.id)
+            elif resource_type == 'ami':
+                resource = ec2.Image(resource.id)
 
-        self.log.debug(
-            'Removing Snapshot {} in Account {} Region {} with size {} GiB created on {}'.format(snapshot.id,
-                                                                                               self.account,
-                                                                                               self.region,
-                                                                                               snapshot.volume_size,
-                                                                                               snapshot.start_time))
-        snapshot.delete()
+        if resource_type == 'snapshot':
+            self.log.debug(
+                'Removing resource {} in Account {} Region {} with size {} GiB created on {}'.format(resource.id,
+                                                                                                     self.account,
+                                                                                                     self.region,
+                                                                                                     resource.volume_size,
+                                                                                                     resource.start_time))
+            resource.delete()
+        elif resource_type == 'ami':
+            self.log.debug(
+                'Removing resource {} {} in Account {} Region {} created on {}'.format(resource.id, resource.name,
+                                                                                       self.account,
+                                                                                       self.region,
+                                                                                       resource.creation_date))
+            resource.deregister()
+        else:
+            resource.delete()
 
 
 # From http://stackoverflow.com/questions/3041986/apt-command-line-interface-like-yes-no-input
