@@ -9,6 +9,7 @@ import argparse
 import logging
 import json
 import uuid
+from functools import partial
 from multiprocessing.pool import ThreadPool
 from pprint import pprint
 from retrying import retry
@@ -37,6 +38,7 @@ def main(argv):
     p.add_argument('--pool-size', '-p',
                    help='Thread Pool Size - how many AWS API requests we do in parallel (default: 10)',
                    dest='pool_size', default=10, type=int)
+    p.add_argument('--resource', '-R', help='Resource type, default: %(default)s', choices=('volumes', 'snapshots'), default='volumes')
     p.add_argument('--age', '-a', help='Days after which a Volume is considered orphaned (default: 14)', dest='age',
                    default=14, type=check_positive)
     p.add_argument('--tags', '-t', help='Tag filter in format "key:regex" (E.g. Name:^integration-test)',
@@ -74,7 +76,7 @@ def main(argv):
             for region in regions:
                 try:
                     vol_clean = VolumeCleaner(args, account=account, region=region)
-                    vol_clean.run()
+                    vol_clean.run(args.resource)
                     report_data[account.account_id][region] = vol_clean.removal_log
                 except botocore.exceptions.ClientError as e:
                     if e.response['Error']['Code'] == 'UnauthorizedOperation':
@@ -134,20 +136,23 @@ class VolumeCleaner:
 
     @retry(stop_max_attempt_number=30, wait_exponential_multiplier=3000, wait_exponential_max=120000,
            retry_on_exception=retry_on_request_limit_exceeded)
-    def run(self):
+    def run(self, resource):
         p = ThreadPool(self.args.pool_size)
         try:
-            candidates = list(filter(None, p.map(self.candidate, self.available_volumes())))
+            candidates = list(filter(None, p.map(partial(self.candidate, resource_type=resource), self.available_resources(resource=resource))))
         finally:
             p.close()
             p.join()
         if len(candidates) > 0 and (self.args.all_yes or query_yes_no(
-                'Do you want to remove {} Volumes in Region {}?'.format(len(candidates), self.region))):
+                'Do you want to remove {} {} in Region {}?'.format(len(candidates), resource, self.region))):
             self.log.info(
-                'Removing {} Volumes in Account {} Region {}'.format(len(candidates), self.account, self.region))
+                'Removing {} {} in Account {} Region {}'.format(len(candidates), resource, self.account, self.region))
             p = ThreadPool(self.args.pool_size)
             try:
-                p.map(self.remove_volume, candidates)
+                if resource == 'volumes':
+                    p.map(self.remove_volume, candidates)
+                elif resource == 'snapshots':
+                    p.map(self.remove_snapshot, candidates)
             finally:
                 p.close()
                 p.join()
@@ -155,18 +160,24 @@ class VolumeCleaner:
         else:
             self.log.info('Not doing anything in Account {} Region {}'.format(self.account, self.region))
 
-    def available_volumes(self):
-        self.log.debug('Finding unused Volumes in Account {} Region {}'.format(self.account, self.region))
+    def available_resources(self, resource='volumes'):
+        self.log.debug('Finding unused {} in Account {} Region {}'.format(resource, self.account, self.region))
         session = aws_session(self.account, self.role)
         ec2 = session.resource('ec2', region_name=self.region)
-        volumes = ec2.volumes.filter(Filters=[{'Name': 'status', 'Values': ['available']}])
-        self.log.debug(
-            'Found {} unused Volumes in Account {} Region {}'.format(len(list(volumes)), self.account, self.region))
-        return volumes
+        if resource == 'volumes':
+            resources = ec2.volumes.filter(Filters=[{'Name': 'status', 'Values': ['available']}])
+            self.log.debug(
+                'Found {} unused Volumes in Account {} Region {}'.format(len(list(resources)), self.account, self.region))
+        else:
+            # resources = ec2.snapshots.filter(Filters=[{'Name': 'tag:OS_Version', 'Values': ['Ubuntu']}])
+            resources = ec2.snapshots.filter(OwnerIds=['self'])
+            self.log.debug(
+                'Found {} Snapshots in Account {} Region {}'.format(len(list(resources)), self.account, self.region))
+        return resources
 
     # based on http://blog.ranman.org/cleaning-up-aws-with-boto3/
     def get_metrics(self, volume):
-        self.log.debug('Retrieving Metrics for Volume {} in Account {} Region {}'.format(volume.volume_id, self.account,
+        self.log.debug('Retrieving Metrics for Volume {} in Account {} Region {}'.format(volume.id, self.account,
                                                                                          self.region))
         session = aws_session(self.account, self.role)
         cw = session.client('cloudwatch', region_name=self.region)
@@ -177,7 +188,7 @@ class VolumeCleaner:
         return cw.get_metric_statistics(
             Namespace='AWS/EBS',
             MetricName='VolumeIdleTime',
-            Dimensions=[{'Name': 'VolumeId', 'Value': volume.volume_id}],
+            Dimensions=[{'Name': 'VolumeId', 'Value': volume.id}],
             Period=3600,
             StartTime=start_time,
             EndTime=end_time,
@@ -185,10 +196,10 @@ class VolumeCleaner:
             Unit='Seconds'
         )
 
-    def tag_filter(self, volume):
+    def tag_filter(self, resource, resource_type='volumes'):
         if not self.args.tags:
             return True
-        if not volume.tags:
+        if not resource.tags:
             return False
 
         for tag in self.args.tags:
@@ -196,16 +207,16 @@ class VolumeCleaner:
             if not search_key or not search_value:
                 raise ValueError('Malformed tag search: {}'.format(tag))
 
-            tag_value = next((item['Value'] for item in volume.tags if item['Key'] == search_key), None)
+            tag_value = next((item['Value'] for item in resource.tags if item['Key'] == search_key), None)
             if tag_value is None:
-                self.log.debug('Volume {} in Account {} Region {} has no tag {}'.format(volume.volume_id, self.account,
+                self.log.debug('resource {} in Account {} Region {} has no tag {}'.format(resource.id, self.account,
                                                                                         self.region, search_key))
                 return False
 
             regex = re.compile(search_value)
             if not regex.search(tag_value):
                 self.log.debug(
-                    "Volume {} in Account {} Region {} with tag {}={} doesn't match regex {}".format(volume.volume_id,
+                    "resource {} in Account {} Region {} with tag {}={} doesn't match regex {}".format(resource.id,
                                                                                                      self.account,
                                                                                                      self.region,
                                                                                                      search_key,
@@ -215,46 +226,52 @@ class VolumeCleaner:
 
         return True
 
-    def candidate(self, volume):
-        if not self.tag_filter(volume):
+    def candidate(self, resource, resource_type='volumes'):
+        if not self.tag_filter(resource, resource_type=resource_type):
             self.log.debug(
-                'Volume {} in Account {} Region {} is no candidate for deletion'.format(volume.volume_id, self.account,
+                'resource {} in Account {} Region {} is no candidate for deletion'.format(resource.id, self.account,
                                                                                         self.region))
             return None
 
-        if self.args.ignore_metrics:
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if resource_type == 'volumes':
+            if self.args.ignore_metrics:
+                self.log.debug(
+                    'resource {} in Account {} Region {} is a candidate for deletion'.format(resource.id, self.account,
+                                                                                           self.region))
+                return resource
+
+            metrics = self.get_metrics(resource)
+            if len(metrics['Datapoints']) == 0:
+                expire = resource.create_time + timedelta(days=self.args.age)
+                if now >= expire:
+                    self.log.debug('resource {} in Account {} Region {} has no metrics yet but is older than {} days, so is a candidate for deletion'.format(resource.id,
+                                                                                                            self.account,
+                                                                                                            self.region,
+                                                                                                            self.args.age))
+                    return resource
+                else:
+                    self.log.debug('resource {} in Account {} Region {} has no metrics yet and is no candidate for deletion'.format(resource.id,
+                                                                                                            self.account,
+                                                                                                            self.region))
+                    return None
+
+            for metric in metrics['Datapoints']:
+                if metric['Minimum'] < 299:
+                    self.log.debug('resource {} in Account {} Region {} is no candidate for deletion'.format(resource.id,
+                                                                                                           self.account,
+                                                                                                           self.region))
+                    return None
+        else:
+            # NOTE: this is for Snapshots, we can only use start_time
+            expire = resource.start_time + timedelta(days=self.args.age)
+            if now < expire:
+                return
             self.log.debug(
-                'Volume {} in Account {} Region {} is a candidate for deletion'.format(volume.volume_id, self.account,
+                'resource {} {} in Account {} Region {} is a candidate for deletion'.format(resource.id, resource.description, self.account,
                                                                                        self.region))
-            return volume
 
-        metrics = self.get_metrics(volume)
-        if len(metrics['Datapoints']) == 0:
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            expire = volume.create_time + timedelta(days=self.args.age)
-            if now >= expire:
-                self.log.debug('Volume {} in Account {} Region {} has no metrics yet but is older than {} days, so is a candidate for deletion'.format(volume.volume_id,
-                                                                                                        self.account,
-                                                                                                        self.region,
-                                                                                                        self.args.age))
-                return volume
-            else:
-                self.log.debug('Volume {} in Account {} Region {} has no metrics yet and is no candidate for deletion'.format(volume.volume_id,
-                                                                                                        self.account,
-                                                                                                        self.region))
-                return None
-
-        for metric in metrics['Datapoints']:
-            if metric['Minimum'] < 299:
-                self.log.debug('Volume {} in Account {} Region {} is no candidate for deletion'.format(volume.volume_id,
-                                                                                                       self.account,
-                                                                                                       self.region))
-                return None
-
-        self.log.debug(
-            'Volume {} in Account {} Region {} is a candidate for deletion'.format(volume.volume_id, self.account,
-                                                                                   self.region))
-        return volume
+        return resource
 
     @retry(stop_max_attempt_number=100, wait_exponential_multiplier=1000, wait_exponential_max=30000,
            retry_on_exception=retry_on_request_limit_exceeded)
@@ -262,20 +279,36 @@ class VolumeCleaner:
         if thread_safe:
             session = aws_session(self.account, self.role)
             ec2 = session.resource('ec2', region_name=self.region)
-            volume = ec2.Volume(volume.volume_id)
+            volume = ec2.Volume(volume.id)
 
         self.log.debug(
-            'Removing Volume {} in Account {} Region {} with size {} GiB created on {}'.format(volume.volume_id,
+            'Removing Volume {} in Account {} Region {} with size {} GiB created on {}'.format(volume.id,
                                                                                                self.account,
                                                                                                self.region, volume.size,
                                                                                                volume.create_time))
-        removal_log_record = {'volume_id': volume.volume_id,
+        removal_log_record = {'id': volume.id,
                               'volume_type': volume.volume_type,
                               'size': volume.size,
                               'create_time': str(volume.create_time),
                               'removal_time': '{}+00:00'.format(datetime.utcnow())}
         volume.delete()
         self.removal_log.append(removal_log_record)
+
+    @retry(stop_max_attempt_number=100, wait_exponential_multiplier=1000, wait_exponential_max=30000,
+           retry_on_exception=retry_on_request_limit_exceeded)
+    def remove_snapshot(self, snapshot, thread_safe=True):
+        if thread_safe:
+            session = aws_session(self.account, self.role)
+            ec2 = session.resource('ec2', region_name=self.region)
+            snapshot = ec2.Snapshot(snapshot.id)
+
+        self.log.debug(
+            'Removing Snapshot {} in Account {} Region {} with size {} GiB created on {}'.format(snapshot.id,
+                                                                                               self.account,
+                                                                                               self.region,
+                                                                                               snapshot.volume_size,
+                                                                                               snapshot.start_time))
+        snapshot.delete()
 
 
 # From http://stackoverflow.com/questions/3041986/apt-command-line-interface-like-yes-no-input
